@@ -4,6 +4,8 @@
  * WHMCS Contabo Provisioning Module
  * WHMCS Version: 8.x +
  * Security Hardened Edition
+ * @author Victor Nwachukwu
+ * @version 1.0
  */
 
 if (!defined("WHMCS")) {
