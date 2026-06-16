@@ -82,7 +82,7 @@ private function request($method, $path, $body = null)
 
     $ch = curl_init($url);
     
-    // CRITICAL: Ensure native constants are used without quotes
+    // Ensure native constants are used without quotes
     curl_setopt_array($ch, [
         CURLOPT_CUSTOMREQUEST  => $method,
         CURLOPT_RETURNTRANSFER => true,

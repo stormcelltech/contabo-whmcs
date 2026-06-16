@@ -648,7 +648,7 @@ function contabo_TaskHistory(array $params)
 function contabo_ClientArea(array $params)
 {
     try {
-        // CRITICAL FIX: Only run full API validation if explicitly loading ONE specific service details page.
+        //  Only run full API validation if explicitly loading ONE specific service details page.
         // This completely prevents the global user dashboard service list page from loading blank.
         if (empty($params['serviceid']) || !isset($_GET['id']) || (int)$_GET['id'] !== (int)$params['serviceid']) {
             return [];
