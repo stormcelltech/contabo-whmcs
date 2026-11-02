@@ -1,0 +1,7 @@
+id,name,type,owner,classification
+A001,Contabo API credentials,Access,Security,critical
+A002,WHMCS service properties and provider identifiers,Information,Operations,high
+A003,Provisioning and cancellation workflow,Software,Engineering,critical
+A004,Connector source code,Software,Engineering,high
+A005,CI release artifact and digest,Service,DevOps,high
+A006,WHMCS and Contabo audit evidence,Information,Security,high

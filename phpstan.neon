@@ -1,0 +1,9 @@
+parameters:
+    level: 8
+    paths:
+        - lib/Contracts.php
+        - lib/Http.php
+        - lib/ContaboApi.php
+        - lib/ProvisioningService.php
+        - tests
+    tmpDir: build/phpstan

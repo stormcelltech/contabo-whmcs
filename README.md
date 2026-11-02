@@ -1,107 +1,116 @@
-# Contabo Cloud Compute Provisioning Module for WHMCS
+# Contabo provisioning for WHMCS
 
-[![WHMCS Version](https://img.shields.io/badge/WHMCS-8.x%20or%20higher-blue.svg)](https://docs.whmcs.com/)
-[![Contabo API Version](https://img.shields.io/badge/Contabo%20API-v1%20%2F%201.0.0-orange.svg)](https://api.contabo.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+A fail-closed WHMCS server module for automated Contabo instance creation,
+suspension, unsuspension, cancellation, status display, and optional customer
+power controls.
 
-An enterprise-grade provisioning engine built for WHMCS 8.x+ that integrates seamlessly with the **Contabo Compute Management REST API (v1)**. This module automates the entire infrastructure delivery lifecycle, empowering admins with granular product controls and clients with self-service cloud operations.
+This release replaces the legacy provisioning path with typed contracts,
+durable idempotency evidence, fail-closed recovery, security tests, and an
+auditable release process. It is not an official Contabo or WHMCS product.
 
----
+## Supported platform
 
-## 🚀 Key Features
+- WHMCS 9.1 on its supported Linux/LAMP deployment model
+- PHP 8.2, 8.3, or 8.4 with cURL and JSON
+- Contabo Compute Management API v1
+- MySQL/MariaDB with support for `GET_LOCK`
 
-### 🛠️ Admin Features
+Older WHMCS/PHP versions are intentionally unsupported because they are no
+longer an acceptable production-security baseline.
 
-- **Full Lifecycle Provisioning:** Automate server creation, suspension, unsuspension, and complete termination based on automated payment logic.
-- **Granular Infrastructure Management:** Perform direct action controls including Power On, Power Off, ACPI Shut Down, and Force Reboot.
-- **Server Customization:** Dynamically modify individual instance Display Names to align database states with Contabo.
-- **Telemetry & Network Audits:** View comprehensive server status data flags, assigned MAC addresses, and network details inside the admin services area.
-- **VPS Snapshot Management:** Provision, list, delete, and revert system targets using localized snapshots _(VPS Packages Only)_.
-- **OS Distribution Rebuilds:** Trigger a hard formatting array on a live instance utilizing chosen alternative OS distribution images.
-- **Task Log Histories:** Access structural client activity audit history trails natively from the module interface.
-- **Product Field Assignments:** Map custom fields globally to isolate distinct Regions, Plans, and Operating System images per WHMCS product shell.
-- **Configurable Hostname Profiles:** Define dynamic default hostname prefixes applied automatically on instantiation hooks.
-- **Automated Transactions Mailers:** Fire real-time WHMCS system notifications instantly when instances are created or rebuilt.
+## Safety model
 
-### 👥 Client Area Features
+- **Durable create intent:** request ID, request hash, status, and resulting
+  instance ID are stored as WHMCS Service Properties.
+- **Concurrency control:** a database advisory lock serializes create and
+  terminate commands for each service.
+- **Ambiguous-outcome protection:** create calls are never automatically
+  retried after an uncertain response. A later WHMCS retry searches the exact
+  deterministic display name and adopts it only when exactly one match exists.
+- **Bounded safe retries:** GET and idempotent power actions retry 408, 425, 429,
+  and 5xx responses with capped exponential backoff. Purchase, cancellation,
+  and other non-idempotent operations do not.
+- **Secret-safe observability:** module logs contain service, instance, request,
+  and safe error codes; configured credentials are supplied to WHMCS as log
+  replacement values and raw provider response bodies are not logged.
+- **Fail-closed destruction:** automatic Contabo cancellation is disabled by
+  default. Client power controls are optional, POST-only, and CSRF validated.
+- **Transport hardening:** fixed official HTTPS endpoints, certificate and
+  hostname verification, no redirects, finite connect/response timeouts, and
+  cryptographic UUIDv4 request IDs.
 
-- **Power Control Matrix:** Client-driven execution of Power On, Power Off, ACPI Shut Down, and Force Reboots.
-- **Real-time Diagnostics:** Instant visibility into instance metadata, assigned IPs, runtime states, and region parameters.
-- **Self-Service Backups:** Secure snapshot capture, restoration checkpoints, and automated storage drops.
-- **On-Demand Operating System Reinstalls:** Rebuild cloud environments using a curated drop-down list of standard operating system images.
-- **Audit Transparency:** Read recent task logs and lifecycle actions executed on their specific instance.
-- **Event Notifications:** Receive immediate confirmation emails once system creation or rebuild operations clear the queue.
+## Install
 
----
+1. Download the CI-built archive and verify its `.sha256` file.
+2. Extract the contained `contabo` directory to
+   `WHMCS_ROOT/modules/servers/contabo`.
+3. In WHMCS, open **System Settings → Products/Services → Products**, select the
+   product, and choose **Contabo Cloud Compute** as its module.
+4. Configure:
+   - OAuth2 Client ID and Client Secret;
+   - a dedicated least-privilege Contabo API user and password;
+   - exact region, current product ID, and image UUID;
+   - hostname prefix and contract period;
+   - optional client power controls.
+5. Keep **Automatic Cancellation** disabled until staging has verified the
+   account's contract/cancellation behavior.
 
-## 📋 Requirements
+Do not manually create an `instanceId` custom field. WHMCS Service Properties
+create and own `Contabo Instance ID` and the idempotency evidence automatically.
 
-- **WHMCS Version:** `8.x` or higher (Built using the modern PHP Capsule database layer and localAPI wrappers).
-- **PHP Runtime:** `7.4` to `8.2+`
-- **Contabo API Access:** Active Contabo Customer Control Panel API credentials (OAuth2 Client ID, Client Secret, API User, API Password).
-- **System Extensibility:** Open outbound network communication access on ports `443` to both `auth.contabo.com` and `api.contabo.com`.
+## Lifecycle behavior
 
----
+| WHMCS command | Contabo action | Retry semantics |
+|---|---|---|
+| CreateAccount | `POST /v1/compute/instances` | Never automatically retried after an ambiguous outcome |
+| SuspendAccount | `POST .../actions/stop` | Bounded retry; convergent action |
+| UnsuspendAccount | `POST .../actions/start` | Bounded retry; convergent action |
+| TerminateAccount | `POST .../cancel` | Opt-in; durable intent; ambiguous outcomes block replay |
+| ClientPowerOn | `POST .../actions/start` | Optional, POST + CSRF, common lock and cooldown |
+| ClientPowerOff | `POST .../actions/stop` | Optional, POST + CSRF, common lock and cooldown |
+| ClientReboot | `POST .../actions/restart` | Optional, POST + CSRF, common lock and cooldown |
 
-## ⛓️ Architectural API Endpoints Mapping Reference
+WHMCS retains ownership of billing and service state. Contabo owns the external
+compute resource. This module records provider observations and identifiers; it
+does not infer payment state from Contabo.
 
-This module interfaces natively with the **Contabo v1 API Engine** utilizing structural OAuth2 client-credentials grant authentications. The downstream endpoint routes mapped per internal method call are outlined below:
+## Development and verification
 
-### Core Environment Gateways
+```bash
+composer install
+composer check
+composer audit --locked
+```
 
-- **Identity Token Domain:** `POST https://auth.contabo.com/auth/realms/contabo/protocol/openid-connect/token`
-- **Resource Base Path:** `https://api.contabo.com/v1`
+`composer check` runs PHP syntax lint, PHPUnit contract tests, and PHPStan level
+8. CI executes the suite on PHP 8.2, 8.3, and 8.4, audits locked dependencies,
+scans Git history for secrets, and produces a commit-addressed ZIP plus SHA-256
+digest. CI never deploys.
 
-### Lifecycle Hook Actions Mapping
+The repository tests use a fake transport and never call Contabo or create
+billable resources. A real staging acceptance is mandatory before production;
+follow [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md).
 
-| WHMCS Module Method Hook                 | Trigger Action Method | Targeted Contabo API Endpoint                                        |
-| :--------------------------------------- | :-------------------- | :------------------------------------------------------------------- |
-| `contabo_CreateAccount`                  | **POST**              | `/v1/compute/instances`                                              |
-| `contabo_SuspendAccount`                 | **POST**              | `/v1/compute/instances/{instanceId}/actions/stop`                    |
-| `contabo_UnsuspendAccount`               | **POST**              | `/v1/compute/instances/{instanceId}/actions/start`                   |
-| `contabo_TerminateAccount`               | **POST**              | `/v1/compute/instances/{instanceId}/cancel`                          |
-| `contabo_PowerOn`                        | **POST**              | `/v1/compute/instances/{instanceId}/actions/start`                   |
-| `contabo_PowerOff`                       | **POST**              | `/v1/compute/instances/{instanceId}/actions/stop`                    |
-| `contabo_Shutdown`                       | **POST**              | `/v1/compute/instances/{instanceId}/actions/shutdown`                |
-| `contabo_Reboot`                         | **POST**              | `/v1/compute/instances/{instanceId}/actions/restart`                 |
-| `contabo_ClientArea` (Rebuild)           | **PUT**               | `/v1/compute/instances/{instanceId}`                                 |
-| `contabo_ClientArea` (Snapshots List)    | **GET**               | `/v1/compute/instances/{instanceId}/snapshots`                       |
-| `contabo_ClientArea` (Create Snapshot)   | **POST**              | `/v1/compute/instances/{instanceId}/snapshots`                       |
-| `contabo_ClientArea` (Delete Snapshot)   | **DELETE**            | `/v1/compute/instances/{instanceId}/snapshots/{snapshotId}`          |
-| `contabo_ClientArea` (Rollback Snapshot) | **POST**              | `/v1/compute/instances/{instanceId}/snapshots/{snapshotId}/rollback` |
-| `contabo_ClientArea` (Audit History)     | **GET**               | `/v1/compute/instances/actions/audits`                               |
-| `Helper::getCachedImages` (OS Images)    | **GET**               | `/v1/compute/images`                                                 |
-| `contabo_AdminServicesTabFields`         | **PATCH**             | `/v1/compute/instances/{instanceId}`                                 |
+## Recovery from an ambiguous create
 
----
+Do not clear Service Properties or click Create repeatedly. Re-run the WHMCS
+module command once: it performs a read-only search for the deterministic
+display name. Exactly one match is adopted; zero or multiple matches remain
+blocked for operator reconciliation. Verify the Contabo control panel and
+billing before resetting any evidence. Follow the reviewed
+[ambiguous-create repair runbook](docs/AMBIGUOUS_CREATE_REPAIR.md); the safety
+trade-off is recorded in
+[ADR 0001](docs/ADR-0001-IDEMPOTENT-PROVISIONING.md).
 
-## 🛠️ Installation & Setup
+An ambiguous cancellation is also fail-closed. Follow the
+[termination repair runbook](docs/AMBIGUOUS_TERMINATION_REPAIR.md); never clear
+its request evidence or submit another cancellation merely to remove a WHMCS
+error.
 
-1. **Upload Module Code:** Clone or upload the repository directory structure directly into your WHMCS directory space at `/modules/servers/contabo/`. Ensure all directory permission boundaries are respected.
-2. **Database Field Interfacing:**
-   - Navigate to **System Settings > Products/Services > Products**.
-   - Edit your desired Contabo product profile, and select the **Custom Fields** configuration header.
-   - Add a new tracking field configured exactly as named: `instanceId`.
-   - Set the Field Type parameter to `Text` and configure the checkbox attributes to **Admin Only**.
-3. **Module Parameters Registration:**
-   - Switch directly to the **Module Settings** panel on your target product.
-   - Choose **Contabo Cloud Compute** from the drop-down module list.
-   - Populate your unique `ClientId`, `ClientSecret`, `ApiUser` (Email entry), and `ApiPassword` values retrieved from your Contabo Account Panel under the Security setting context.
-   - Input default presets for regions (`eu`, `us-central`, etc.) along with target infrastructure base product codes.
+The authorized white-box assessment and ISO 27001 component risk record are in
+[docs/security](docs/security). They intentionally keep production blocked
+until the listed WHMCS staging and operational controls have evidence.
 
----
+## License and security
 
-## 🛡️ Security Implementation Matrix
-
-To ensure compliance within critical enterprise payment operations, the engine integrates strict systemic defense configurations:
-
-- **CSRF Defenses:** Enforces native validation checks on all incoming multi-tenant payload requests via token injection mappings (`checkToken()`).
-- **Input Injection Mitigation:** Strict type-casting algorithms and precise regular expressions (`preg_replace`) eliminate parameter pollution vectors across API pathways.
-- **Information Disclosure Prevention:** Suppresses detailed API core stack trace exposures in front-facing panels, safely processing raw exception errors through WHMCS internal system module logs.
-- **Rate-Limit Optimization:** Implements local database data caches for resource endpoints (such as `/v1/compute/images`) to maintain maximum processing speeds while completely mitigating API rate limits.
-
----
-
-## 📄 License
-
-This provisioning integration module framework is open-source software licensed under the terms of the **[MIT License](LICENSE)**.
+MIT licensed. See [LICENSE](LICENSE) and [SECURITY.md](SECURITY.md).

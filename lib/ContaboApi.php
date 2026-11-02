@@ -1,139 +1,269 @@
 <?php
 
-namespace Contabo\Api;
+declare(strict_types=1);
 
-class ContaboApi
+namespace Contabo\Whmcs;
+
+use JsonException;
+
+final class ContaboApi implements ContaboClient
 {
-    private $clientId;
-    private $clientSecret;
-    private $apiUser;
-    private $apiPassword;
-    private $accessToken;
-    private $tokenExpiry;
-    private $baseUrl = 'https://api.contabo.com/v1';
-    private $authUrl = 'https://auth.contabo.com/auth/realms/contabo/protocol/openid-connect/token';
+    private const API_BASE = 'https://api.contabo.com/v1';
+    private const AUTH_URL = 'https://auth.contabo.com/auth/realms/contabo/protocol/openid-connect/token';
 
-    public function __construct($clientId, $clientSecret, $apiUser, $apiPassword)
-    {
-        $this->clientId     = trim($clientId);
-        $this->clientSecret = trim($clientSecret);
-        $this->apiUser      = trim($apiUser);
-        $this->apiPassword  = trim($apiPassword);
+    private ?string $accessToken = null;
+    private int $tokenExpiresAt = 0;
+
+    /** @param callable(int): void|null $sleeper */
+    public function __construct(
+        private readonly ModuleConfig $config,
+        private readonly HttpTransport $transport,
+        private readonly mixed $sleeper = null,
+    ) {
     }
 
-    private function getAccessToken()
+    public function createInstance(CreateInstanceCommand $command, string $requestId): Instance
     {
-        if ($this->accessToken && $this->tokenExpiry > time() + 30) {
-            return $this->accessToken;
-        }
-
-        $ch = curl_init($this->authUrl);
-        curl_setopt_array($ch, [
-            CURLOPT_POST           => true,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POSTFIELDS     => http_build_query([
-                'client_id'     => $this->clientId,
-                'client_secret' => $this->clientSecret,
-                'username'      => $this->apiUser,
-                'password'      => $this->apiPassword,
-                'grant_type'    => 'password',
-            ]),
-            CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
-            CURLOPT_TIMEOUT    => 30,
-        ]);
-
-        $raw = curl_exec($ch);
-        $response = json_decode($raw, true);
-        curl_close($ch);
-
-        if (empty($response['access_token'])) {
-            throw new \Exception('Contabo: Gateway Authentication Blocked. Please check global setting keys inside Module Settings panels.');
-        }
-
-        $this->accessToken = $response['access_token'];
-        $this->tokenExpiry = time() + ($response['expires_in'] ?? 3600);
-
-        return $this->accessToken;
+        $data = $this->request('POST', '/compute/instances', $command->toPayload(), false, $requestId);
+        return Instance::fromApi($this->firstDataRow($data, true, $requestId));
     }
 
-    private function requestId()
+    public function findInstancesByDisplayName(string $displayName): array
     {
-        return sprintf(
-            '%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
-            mt_rand(0, 0xffff), mt_rand(0, 0xffff),
-            mt_rand(0, 0xffff),
-            mt_rand(0, 0x0fff) | 0x4000,
-            mt_rand(0, 0x3fff) | 0x8000,
-            mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff)
+        $query = http_build_query(['displayName' => $displayName, 'size' => 100], '', '&', PHP_QUERY_RFC3986);
+        $data = $this->request('GET', '/compute/instances?' . $query, null, true);
+        $rows = $data['data'] ?? [];
+        if (!is_array($rows)) {
+            throw new ProtocolException('Contabo returned an invalid instance list.');
+        }
+
+        $instances = [];
+        foreach ($rows as $row) {
+            if (is_array($row) && (string) ($row['displayName'] ?? '') === $displayName) {
+                $instances[] = Instance::fromApi($row);
+            }
+        }
+        return $instances;
+    }
+
+    public function getInstance(int $instanceId): Instance
+    {
+        $data = $this->request('GET', '/compute/instances/' . $this->positiveId($instanceId), null, true);
+        return Instance::fromApi($this->firstDataRow($data));
+    }
+
+    public function startInstance(int $instanceId): void
+    {
+        $this->request('POST', '/compute/instances/' . $this->positiveId($instanceId) . '/actions/start', [], true);
+    }
+
+    public function stopInstance(int $instanceId): void
+    {
+        $this->request('POST', '/compute/instances/' . $this->positiveId($instanceId) . '/actions/stop', [], true);
+    }
+
+    public function restartInstance(int $instanceId): void
+    {
+        $this->request('POST', '/compute/instances/' . $this->positiveId($instanceId) . '/actions/restart', [], true);
+    }
+
+    public function cancelInstance(int $instanceId, string $cancelDate, string $requestId): void
+    {
+        if (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/', $cancelDate) !== 1) {
+            throw new \InvalidArgumentException('Cancellation date must be an RFC 3339 UTC timestamp.');
+        }
+        $this->request(
+            'POST',
+            '/compute/instances/' . $this->positiveId($instanceId) . '/cancel',
+            ['cancelDate' => $cancelDate],
+            false,
+            $requestId,
         );
     }
 
-private function request($method, $path, $body = null)
-{
-    $token = $this->getAccessToken();
-    $url   = $this->baseUrl . $path;
-    $method = strtoupper($method);
+    /**
+     * @param array<string, mixed>|null $payload
+     * @return array<string, mixed>
+     */
+    private function request(string $method, string $path, ?array $payload, bool $retrySafe, ?string $requestId = null): array
+    {
+        $requestId ??= self::uuidV4();
+        $attempts = $retrySafe ? 3 : 1;
+        $refreshedToken = false;
 
-    $headers = [
-        'Authorization: Bearer ' . $token,
-        'Content-Type: application/json',
-        'x-request-id: ' . $this->requestId(),
-    ];
+        for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+            $body = $payload === null ? null : $this->encodeJson($payload);
+            try {
+                $response = $this->transport->send(new HttpRequest(
+                    method: $method,
+                    url: self::API_BASE . $path,
+                    headers: [
+                        'Authorization' => 'Bearer ' . $this->accessToken(),
+                        'Accept' => 'application/json',
+                        'Content-Type' => 'application/json',
+                        'User-Agent' => 'contabo-whmcs/2.0',
+                        'x-request-id' => $requestId,
+                        'x-trace-id' => 'whmcs-' . substr(hash('sha256', $requestId), 0, 24),
+                    ],
+                    body: $body,
+                ));
+            } catch (ContaboException $exception) {
+                if ($retrySafe && $attempt < $attempts) {
+                    $this->sleep($attempt);
+                    continue;
+                }
+                throw new ContaboException(
+                    $exception->getMessage(),
+                    $exception->safeCode,
+                    $exception->retryable,
+                    $exception->ambiguous,
+                    $requestId,
+                    $exception->httpStatus,
+                );
+            }
 
-    $ch = curl_init($url);
-    
-    // Ensure native constants are used without quotes
-    curl_setopt_array($ch, [
-        CURLOPT_CUSTOMREQUEST  => $method,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER     => $headers,
-        CURLOPT_TIMEOUT        => 30,
-    ]);
+            if ($response->status === 401 && !$refreshedToken) {
+                $this->accessToken = null;
+                $this->tokenExpiresAt = 0;
+                $refreshedToken = true;
+                $attempt--;
+                continue;
+            }
+            if ($this->isRetryableStatus($response->status) && $retrySafe && $attempt < $attempts) {
+                $this->sleep($attempt, $response->header('retry-after'));
+                continue;
+            }
+            if ($response->status < 200 || $response->status >= 300) {
+                throw new ContaboException(
+                    'Contabo rejected the request (HTTP ' . $response->status . ').',
+                    'api_http_' . $response->status,
+                    $this->isRetryableStatus($response->status),
+                    !$retrySafe && $response->status >= 500,
+                    $requestId,
+                    $response->status,
+                );
+            }
+            if ($response->status === 204 || trim($response->body) === '') {
+                return [];
+            }
+            return $this->decodeJson($response->body, !$retrySafe, $requestId);
+        }
 
-    // Force empty payload protection block for write actions
-    if (in_array($method, ['POST', 'PUT', 'PATCH'])) {
-        if ($body === null || (is_array($body) && empty($body))) {
-            curl_setopt($ch, CURLOPT_POSTFIELDS, '{}');
-        } else {
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body));
+        throw new ContaboException('Contabo request retries were exhausted.', 'retry_exhausted', true, false, $requestId);
+    }
+
+    private function accessToken(): string
+    {
+        if ($this->accessToken !== null && $this->tokenExpiresAt > time() + 60) {
+            return $this->accessToken;
+        }
+        $body = http_build_query([
+            'grant_type' => 'password',
+            'client_id' => $this->config->clientId,
+            'client_secret' => $this->config->clientSecret,
+            'username' => $this->config->apiUser,
+            'password' => $this->config->apiPassword,
+        ], '', '&', PHP_QUERY_RFC3986);
+        try {
+            $response = $this->transport->send(new HttpRequest(
+                'POST',
+                self::AUTH_URL,
+                ['Accept' => 'application/json', 'Content-Type' => 'application/x-www-form-urlencoded', 'User-Agent' => 'contabo-whmcs/2.0'],
+                $body,
+            ));
+        } catch (ContaboException $exception) {
+            throw new ContaboException(
+                'Contabo authentication could not be completed.',
+                'authentication_transport_failure',
+                true,
+                false,
+                null,
+                $exception->httpStatus,
+            );
+        }
+        if ($response->status < 200 || $response->status >= 300) {
+            throw new ContaboException('Contabo authentication failed.', 'authentication_failed', false, false, null, $response->status);
+        }
+        $data = $this->decodeJson($response->body, false, null);
+        $token = $data['access_token'] ?? null;
+        if (!is_string($token) || $token === '') {
+            throw new ProtocolException('Contabo authentication returned no access token.');
+        }
+        $expiresIn = filter_var($data['expires_in'] ?? 300, FILTER_VALIDATE_INT);
+        $this->accessToken = $token;
+        $this->tokenExpiresAt = time() + max(120, $expiresIn === false ? 300 : (int) $expiresIn);
+        return $token;
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function encodeJson(array $payload): string
+    {
+        try {
+            return json_encode($payload, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+        } catch (JsonException) {
+            throw new ProtocolException('Unable to encode a Contabo request.');
         }
     }
 
-    $raw  = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $err  = curl_error($ch);
-    curl_close($ch);
-
-    if ($err) {
-        throw new \Exception('Contabo API cURL error: ' . $err);
+    /** @return array<string, mixed> */
+    private function decodeJson(string $body, bool $ambiguous, ?string $requestId): array
+    {
+        try {
+            $decoded = json_decode($body, true, 64, JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            throw new ProtocolException('Contabo returned malformed JSON.', $ambiguous, $requestId);
+        }
+        if (!is_array($decoded)) {
+            throw new ProtocolException('Contabo returned an invalid JSON document.', $ambiguous, $requestId);
+        }
+        return $decoded;
     }
 
-    $data = json_decode($raw, true);
-
-    if ($code >= 400) {
-        $msg = $data['message'] ?? $data['error'] ?? $raw;
-        if (is_array($msg)) { $msg = json_encode($msg); }
-        throw new \Exception("Contabo API error {$code}: {$msg}");
+    /**
+     * @param array<string, mixed> $response
+     * @return array<string, mixed>
+     */
+    private function firstDataRow(array $response, bool $ambiguous = false, ?string $requestId = null): array
+    {
+        $row = $response['data'][0] ?? null;
+        if (!is_array($row)) {
+            throw new ProtocolException('Contabo returned no instance record.', $ambiguous, $requestId);
+        }
+        return $row;
     }
 
-    return $data;
-}
+    private function positiveId(int $id): int
+    {
+        if ($id <= 0) {
+            throw new \InvalidArgumentException('Instance ID must be positive.');
+        }
+        return $id;
+    }
 
-    public function getInstances($page = 1, $size = 100) { return $this->request('GET', "/compute/instances?page={$page}&size={$size}"); }
-    public function getInstance($instanceId) { return $this->request('GET', "/compute/instances/{$instanceId}"); }
-    public function createInstance($params) { return $this->request('POST', '/compute/instances', $params); }
-    public function updateInstance($instanceId, $displayName) { return $this->request('PATCH', "/compute/instances/{$instanceId}", ['displayName' => $displayName]); }
-    public function reinstallInstance($instanceId, $imageId, $extraParams = []) { return $this->request('PUT', "/compute/instances/{$instanceId}", array_merge(['imageId' => $imageId], $extraParams)); }
-    public function cancelInstance($instanceId, $cancelDate = null) { $body = []; if ($cancelDate) { $body['cancelDate'] = $cancelDate; } return $this->request('POST', "/compute/instances/{$instanceId}/cancel", $body); }
-    public function startInstance($instanceId) { return $this->request('POST', "/compute/instances/{$instanceId}/actions/start"); }
-    public function stopInstance($instanceId) { return $this->request('POST', "/compute/instances/{$instanceId}/actions/stop"); }
-    public function shutdownInstance($instanceId) { return $this->request('POST', "/compute/instances/{$instanceId}/actions/shutdown"); }
-    public function restartInstance($instanceId) { return $this->request('POST', "/compute/instances/{$instanceId}/actions/restart"); }
-    public function getSnapshots($instanceId, $page = 1, $size = 100) { return $this->request('GET', "/compute/instances/{$instanceId}/snapshots?page={$page}&size={$size}"); }
-    public function createSnapshot($instanceId, $name, $description = '') { return $this->request('POST', "/compute/instances/{$instanceId}/snapshots", ['name' => $name, 'description' => $description]); }
-    public function deleteSnapshot($instanceId, $snapshotId) { return $this->request('DELETE', "/compute/instances/{$instanceId}/snapshots/{$snapshotId}"); }
-    public function restoreSnapshot($instanceId, $snapshotId) { return $this->request('POST', "/compute/instances/{$instanceId}/snapshots/{$snapshotId}/rollback"); }
-    public function getImages($page = 1, $size = 100) { return $this->request('GET', "/compute/images?page={$page}&size={$size}"); }
-    public function getInstanceAudits($instanceId = null, $page = 1, $size = 50) { $q = "?page={$page}&size={$size}"; if ($instanceId) { $q .= "&instanceId={$instanceId}"; } return $this->request('GET', "/compute/instances/audits{$q}"); }
-    public function getActionAudits($instanceId = null, $page = 1, $size = 50) { $q = "?page={$page}&size={$size}"; if ($instanceId) { $q .= "&instanceId={$instanceId}"; } return $this->request('GET', "/compute/instances/actions/audits{$q}"); }
+    private function isRetryableStatus(int $status): bool
+    {
+        return in_array($status, [408, 425, 429], true) || $status >= 500;
+    }
+
+    private function sleep(int $attempt, ?string $retryAfter = null): void
+    {
+        $seconds = min(8, 2 ** ($attempt - 1));
+        if ($retryAfter !== null && ctype_digit($retryAfter)) {
+            $seconds = min(30, max($seconds, (int) $retryAfter));
+        }
+        $seconds = (int) $seconds;
+        if (is_callable($this->sleeper)) {
+            ($this->sleeper)($seconds);
+        } else {
+            sleep($seconds);
+        }
+    }
+
+    public static function uuidV4(): string
+    {
+        $bytes = random_bytes(16);
+        $bytes[6] = chr((ord($bytes[6]) & 0x0f) | 0x40);
+        $bytes[8] = chr((ord($bytes[8]) & 0x3f) | 0x80);
+        return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($bytes), 4));
+    }
 }

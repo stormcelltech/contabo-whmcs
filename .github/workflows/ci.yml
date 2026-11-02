@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, json
+          coverage: none
+          tools: composer:v2
+      - run: composer validate --strict
+      - run: composer install --no-interaction --prefer-dist --no-progress
+      - run: composer check
+      - run: composer audit --locked --no-interaction --abandoned=fail
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install pinned Gitleaks
+        run: |
+          curl --fail --silent --show-error --location \
+            --output /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          echo "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c  /tmp/gitleaks.tar.gz" | sha256sum --check --strict
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+      - name: Scan complete Git history
+        run: /tmp/gitleaks detect --source . --redact --no-banner --log-opts="--all"
+
+  package:
+    needs: [test, secret-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build immutable module archive
+        run: |
+          mkdir -p build
+          git archive --format=zip --prefix=contabo/ \
+            -o "build/contabo-whmcs-${GITHUB_SHA}.zip" HEAD \
+            contabo.php lib templates LICENSE README.md SECURITY.md docs
+          sha256sum "build/contabo-whmcs-${GITHUB_SHA}.zip" > "build/contabo-whmcs-${GITHUB_SHA}.zip.sha256"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: contabo-whmcs-${{ github.sha }}
+          path: build/*
+          if-no-files-found: error
+          retention-days: 30
